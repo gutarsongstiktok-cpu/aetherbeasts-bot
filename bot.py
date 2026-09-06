@@ -1,4 +1,288 @@
+"""
+        CREATE TABLE IF NOT EXISTS pets (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            name TEXT NOT NULL,
+            rarity TEXT NOT NULL,
+            power INTEGER NOT NULL,
+            level INTEGER NOT NULL DEFAULT 1,
+            xp INTEGER NOT NULL DEFAULT 0,
+            attack INTEGER NOT NULL DEFAULT 0,
+            defense INTEGER NOT NULL DEFAULT 0,
+            hp INTEGER NOT NULL DEFAULT 0,
+            element TEXT NOT NULL DEFAULT 'Aether',
+            evolution_stage INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        "CREATE INDEX IF NOT EXISTS idx_pets_user_id ON pets(user_id)",
+        """
+        CREATE TABLE IF NOT EXISTS inventory (
+            user_id BIGINT NOT NULL,
+            item_key TEXT NOT NULL,
+            qty INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(user_id, item_key)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS achievements (
+            user_id BIGINT NOT NULL,
+            code TEXT NOT NULL,
+            claimed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY(user_id, code)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS referrals (
+            referrer_id BIGINT NOT NULL,
+            referred_id BIGINT PRIMARY KEY,
+            reward_given BOOLEAN NOT NULL DEFAULT FALSE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS clan_members (
+            clan_id BIGINT NOT NULL,
+            user_id BIGINT PRIMARY KEY,
+            joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS clans (
+            id BIGSERIAL PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            owner_id BIGINT NOT NULL,
+            level INTEGER NOT NULL DEFAULT 1,
+            xp INTEGER NOT NULL DEFAULT 0,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS battle_logs (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            won BOOLEAN NOT NULL,
+            player_power INTEGER NOT NULL,
+            enemy_power INTEGER NOT NULL,
+            reward BIGINT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+    ]
+    with get_db() as db:
+        for sql in statements:
+            db.execute(sql)
+        # Migrate old versions from the original bot.
+        existing = {r["column_name"] for r in db.execute("""
+            SELECT column_name FROM information_schema.columns WHERE table_name='players'
+        """).fetchall()}
+        player_cols = {
+            "wins": "INTEGER NOT NULL DEFAULT 0", "losses": "INTEGER NOT NULL DEFAULT 0",
+            "summons": "INTEGER NOT NULL DEFAULT 0", "merges": "INTEGER NOT NULL DEFAULT 0",
+            "battles": "INTEGER NOT NULL DEFAULT 0", "last_battle_at": "TIMESTAMPTZ",
+            "daily_date": "DATE", "daily_streak": "INTEGER NOT NULL DEFAULT 0",
+            "referral_code": "TEXT", "referrer_id": "BIGINT",
+            "quest_date": "DATE", "quest_summons": "INTEGER NOT NULL DEFAULT 0",
+            "quest_wins": "INTEGER NOT NULL DEFAULT 0", "quest_merges": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for col, typ in player_cols.items():
+            if col not in existing:
+                db.execute(f"ALTER TABLE players ADD COLUMN {col} {typ}")
+        # Existing pets get derived combat stats without losing data.
+        pet_existing = {r["column_name"] for r in db.execute("""
+            SELECT column_name FROM information_schema.columns WHERE table_name='pets'
+        """).fetchall()}
+        pet_cols = {
+            "level": "INTEGER NOT NULL DEFAULT 1", "xp": "INTEGER NOT NULL DEFAULT 0",
+            "attack": "INTEGER NOT NULL DEFAULT 0", "defense": "INTEGER NOT NULL DEFAULT 0",
+            "hp": "INTEGER NOT NULL DEFAULT 0", "element": "TEXT NOT NULL DEFAULT 'Aether'",
+            "evolution_stage": "INTEGER NOT NULL DEFAULT 1",
+        }
+        for col, typ in pet_cols.items():
+            if col not in pet_existing:
+                db.execute(f"ALTER TABLE pets ADD COLUMN {col} {typ}")
+        db.execute("UPDATE players SET referral_code = COALESCE(referral_code, user_id::text) WHERE referral_code IS NULL")
+        db.execute("ALTER TABLE players DROP CONSTRAINT IF EXISTS players_referral_code_key")
+        db.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_players_referral_code ON players(referral_code)")
+        db.execute("UPDATE pets SET attack = CASE WHEN attack=0 THEN GREATEST(1, power/2) ELSE attack END")
+        db.execute("UPDATE pets SET defense = CASE WHEN defense=0 THEN GREATEST(1, power/4) ELSE defense END")
+        db.execute("UPDATE pets SET hp = CASE WHEN hp=0 THEN GREATEST(10, power*2) ELSE hp END")
 
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def today_utc():
+    return now_utc().date()
+
+
+def ensure_player(user_id: int, username: str | None = None):
+    username = username or ""
+    with get_db() as db:
+        p = db.execute("SELECT * FROM players WHERE user_id=%s", (user_id,)).fetchone()
+        if not p:
+            db.execute("INSERT INTO players(user_id, username, referral_code) VALUES(%s,%s,%s)", (user_id, username, str(user_id)))
+            return db.execute("SELECT * FROM players WHERE user_id=%s", (user_id,)).fetchone()
+        if username and p["username"] != username:
+            db.execute("UPDATE players SET username=%s WHERE user_id=%s", (username, user_id))
+            p["username"] = username
+        return p
+
+
+def xp_needed(level: int):
+    if level >= MAX_LEVEL:
+        return 0
+    return 100 + (level - 1) * 75
+
+
+def level_reward(level: int):
+    return 50 + (level - 1) * 25
+
+
+def add_player_xp(user_id: int, amount: int):
+    level_ups = []
+    with get_db() as db:
+        row = db.execute("SELECT level,xp FROM players WHERE user_id=%s FOR UPDATE", (user_id,)).fetchone()
+        if not row or row["level"] >= MAX_LEVEL:
+            return level_ups
+        level, xp = row["level"], row["xp"] + amount
+        while level < MAX_LEVEL and xp >= xp_needed(level):
+            xp -= xp_needed(level)
+            level += 1
+            reward = level_reward(level)
+            db.execute("UPDATE players SET aether=aether+%s WHERE user_id=%s", (reward, user_id))
+            level_ups.append((level, reward))
+        if level >= MAX_LEVEL:
+            xp = 0
+        db.execute("UPDATE players SET level=%s,xp=%s WHERE user_id=%s", (level, xp, user_id))
+    return level_ups
+
+
+def random_element(name: str):
+    n = name.lower()
+    if any(x in n for x in ("ember", "flame", "inferno")):
+        return "Ember"
+    if any(x in n for x in ("frost", "ice")):
+        return "Frost"
+    if any(x in n for x in ("thunder", "storm")):
+        return "Storm"
+    if any(x in n for x in ("shadow", "void")):
+        return "Shadow"
+    if "stone" in n:
+        return "Stone"
+    return random.choice(list(ELEMENTS))
+
+
+def generate_pet(rarity=None, name=None, power=None):
+    rarity = rarity or random.choices(list(RARITY_CHANCES), weights=list(RARITY_CHANCES.values()))[0]
+    name = name or random.choice(PETS[rarity])
+    if power is None:
+        lo, hi = RARITY_POWER[rarity]
+        power = random.randint(lo, hi)
+    attack = max(2, int(power * random.uniform(0.40, 0.58)))
+    defense = max(2, int(power * random.uniform(0.20, 0.36)))
+    hp = max(20, power * 2 + random.randint(0, power))
+    return {"name": name, "rarity": rarity, "power": power, "attack": attack, "defense": defense, "hp": hp, "element": random_element(name)}
+
+
+def save_pet(user_id, pet):
+    with get_db() as db:
+        db.execute("""
+            INSERT INTO pets(user_id,name,rarity,power,level,xp,attack,defense,hp,element,evolution_stage)
+            VALUES(%s,%s,%s,%s,1,0,%s,%s,%s,%s,1)
+        """, (user_id, pet["name"], pet["rarity"], pet["power"], pet["attack"], pet["defense"], pet["hp"], pet["element"]))
+
+
+def get_aether(user_id):
+    row = db_one("SELECT aether FROM players WHERE user_id=%s", (user_id,))
+    return row["aether"] if row else 0
+
+
+def reward_activity(user_id, activity: str):
+    with get_db() as db:
+        if activity == "summon":
+            db.execute("UPDATE players SET summons=summons+1 WHERE user_id=%s", (user_id,))
+        elif activity == "merge":
+            db.execute("UPDATE players SET merges=merges+1 WHERE user_id=%s", (user_id,))
+        elif activity == "battle":
+            db.execute("UPDATE players SET battles=battles+1 WHERE user_id=%s", (user_id,))
+
+
+def add_item(user_id, item_key, qty=1):
+    with get_db() as db:
+        db.execute("""
+            INSERT INTO inventory(user_id,item_key,qty) VALUES(%s,%s,%s)
+            ON CONFLICT(user_id,item_key) DO UPDATE SET qty=inventory.qty+EXCLUDED.qty
+        """, (user_id, item_key, qty))
+
+
+def item_qty(user_id, item_key):
+    row = db_one("SELECT qty FROM inventory WHERE user_id=%s AND item_key=%s", (user_id, item_key))
+    return row["qty"] if row else 0
+
+
+def use_item(user_id, item_key):
+    with get_db() as db:
+        row = db.execute("SELECT qty FROM inventory WHERE user_id=%s AND item_key=%s FOR UPDATE", (user_id, item_key)).fetchone()
+        if not row or row["qty"] <= 0:
+            return False
+        db.execute("UPDATE inventory SET qty=qty-1 WHERE user_id=%s AND item_key=%s", (user_id, item_key))
+        return True
+
+
+def achievement_progress(user_id):
+    row = db_one("SELECT * FROM players WHERE user_id=%s", (user_id,))
+    pet_count = db_one("SELECT COUNT(*) AS c FROM pets WHERE user_id=%s", (user_id,))["c"] if row else 0
+    has_legendary = db_one("SELECT 1 FROM pets WHERE user_id=%s AND rarity='Legendary' LIMIT 1", (user_id,)) is not None
+    return row, int(pet_count), has_legendary
+
+
+def achievement_met(code, player, pet_count, has_legendary):
+    conditions = {
+        "first_pet": pet_count >= 1,
+        "collector_5": pet_count >= 5,
+        "collector_15": pet_count >= 15,
+        "summon_10": player["summons"] >= 10,
+        "merge_5": player["merges"] >= 5,
+        "battle_10": player["wins"] >= 10,
+        "battle_50": player["wins"] >= 50,
+        "level_10": player["level"] >= 10,
+        "legendary": has_legendary,
+    }
+    return conditions.get(code, False)
+
+
+def check_achievements(user_id):
+    player, count, legendary = achievement_progress(user_id)
+    unlocked = []
+    with get_db() as db:
+        for code, title, desc, reward, kind in ACHIEVEMENTS:
+            if achievement_met(code, player, count, legendary):
+                exists = db.execute("SELECT 1 FROM achievements WHERE user_id=%s AND code=%s", (user_id, code)).fetchone()
+                if not exists:
+                    db.execute("INSERT INTO achievements(user_id,code) VALUES(%s,%s)", (user_id, code))
+                    db.execute("UPDATE players SET aether=aether+%s WHERE user_id=%s", (reward, user_id))
+                    unlocked.append((title, reward))
+    return unlocked
+
+
+def daily_status(user_id):
+    p = db_one("SELECT daily_date,daily_streak FROM players WHERE user_id=%s", (user_id,))
+    if not p:
+        return 0, True
+    if p["daily_date"] == today_utc():
+        return p["daily_streak"], False
+    return p["daily_streak"], True
+
+
+def clan_for_user(user_id):
+    return db_one("""
+        SELECT c.* FROM clans c JOIN clan_members m ON m.clan_id=c.id WHERE m.user_id=%s
+    """, (user_id,))
+
+
+# ============================================================
 # KEYBOARDS
 # ============================================================
 
