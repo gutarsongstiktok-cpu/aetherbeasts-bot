@@ -615,3 +615,478 @@ async def achievements_cb(c: CallbackQuery):
 
 
 # ============================================================
+# SUMMON
+# ============================================================
+
+@dp.callback_query(F.data == "summon")
+async def summon_cb(c: CallbackQuery):
+    uid = c.from_user.id
+    ensure_player(uid, c.from_user.username)
+    charm = item_qty(uid, "lucky_charm")
+    # Lucky Charm is consumed only if a summon succeeds.
+    with get_db() as db:
+        player = db.execute("SELECT aether FROM players WHERE user_id=%s FOR UPDATE", (uid,)).fetchone()
+        if player["aether"] < SUMMON_COST:
+            await c.answer(f"Нужно {SUMMON_COST} AETHER. У тебя {player['aether']}.", show_alert=True)
+            return
+        db.execute("UPDATE players SET aether=aether-%s WHERE user_id=%s", (SUMMON_COST, uid))
+    chances = dict(RARITY_CHANCES)
+    if charm:
+        chances["Legendary"] += 15
+        chances["Epic"] += 5
+        if not use_item(uid, "lucky_charm"):
+            pass
+    pet = generate_pet(rarity=random.choices(list(chances), weights=list(chances.values()))[0])
+    save_pet(uid, pet)
+    reward_activity(uid, "summon")
+    # daily counter
+    add_item(uid, f"daily_summon_{today_utc().isoformat()}", 1)
+    # check first-pet / legendary achievements immediately
+    ups = add_player_xp(uid, XP_SUMMON)
+    unlocked = check_achievements(uid)
+    balance = get_aether(uid)
+    extra = ""
+    if ups:
+        extra += "\n\n🎉 <b>LEVEL UP!</b>\n" + "\n".join(f"⭐ {lvl} • +{reward} AETHER" for lvl, reward in ups)
+    if unlocked:
+        extra += "\n\n🏆 <b>Достижение!</b>\n" + "\n".join(f"{t} • +{r}" for t, r in unlocked)
+    await c.message.edit_text(
+        "✨ <b>НОВОЕ СУЩЕСТВО!</b>\n\n"
+        f"{RARITY_EMOJI[pet['rarity']]} <b>{pet['name']}</b>\n"
+        f"⭐ {pet['rarity']} • {ELEMENTS.get(pet['element'],'✨')} {pet['element']}\n"
+        f"⚡ Сила: <b>{pet['power']}</b>\n"
+        f"⚔️ {pet['attack']}  🛡 {pet['defense']}  ❤️ {pet['hp']}\n\n"
+        f"💸 -{SUMMON_COST} AETHER\n✨ +{XP_SUMMON} XP\n💰 Баланс: <b>{balance}</b>"
+        + extra,
+        reply_markup=main_kb(),
+    )
+    await c.answer("Призыв успешен! ✨")
+
+
+# ============================================================
+# MERGE
+# ============================================================
+
+def get_merge_options(user_id):
+    rows = db_all("""
+        SELECT name,rarity,COUNT(*) AS count FROM pets WHERE user_id=%s
+        GROUP BY name,rarity HAVING COUNT(*)>=3
+    """, (user_id,))
+    options = []
+    for row in rows:
+        rarity = row["rarity"]
+        if rarity == "Legendary":
+            continue
+        idx = RARITY_ORDER.index(rarity)
+        next_rarity = RARITY_ORDER[idx + 1]
+        next_name = EVOLUTION_CHAINS.get(row["name"], {}).get(next_rarity) or PETS[next_rarity][0]
+        options.append((row["name"], rarity, row["count"], next_rarity, next_name))
+    options.sort(key=lambda x: RARITY_ORDER.index(x[1]))
+    return options
+
+
+@dp.callback_query(F.data == "merge")
+async def merge_menu(c: CallbackQuery):
+    opts = get_merge_options(c.from_user.id)
+    if not opts:
+        await c.message.edit_text("🧬 <b>MERGE LAB</b>\n\nСейчас нет тройки одинаковых существ.\n\nСобери 3 одинаковых зверя, чтобы поднять редкость.", reply_markup=back_kb())
+        await c.answer()
+        return
+    lines = ["🧬 <b>MERGE LAB</b>\n\n3 одинаковых → следующий ранг:\n"]
+    buttons = []
+    for i, (name, rarity, count, next_rarity, next_name) in enumerate(opts):
+        lines.append(f"{RARITY_EMOJI[rarity]} <b>{name}</b> ×{count} → {RARITY_EMOJI[next_rarity]} <b>{next_name}</b>")
+        buttons.append([InlineKeyboardButton(text=f"🧬 {name} ×3 → {next_name}", callback_data=f"merge_do:{i}")])
+    buttons.append([InlineKeyboardButton(text="🏠", callback_data="home")])
+    await c.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("merge_do:"))
+async def merge_do(c: CallbackQuery):
+    uid = c.from_user.id
+    idx = int(c.data.split(":")[1])
+    opts = get_merge_options(uid)
+    if idx >= len(opts):
+        await c.answer("Эта эволюция уже недоступна", show_alert=True)
+        return
+    name, rarity, _, next_rarity, next_name = opts[idx]
+    with get_db() as db:
+        selected = db.execute("""
+            SELECT id,power,attack,defense,hp FROM pets WHERE user_id=%s AND name=%s AND rarity=%s
+            ORDER BY power ASC LIMIT 3 FOR UPDATE
+        """, (uid, name, rarity)).fetchall()
+        if len(selected) < 3:
+            await c.answer("Нужно 3 одинаковых существа", show_alert=True)
+            return
+        ids = [x["id"] for x in selected]
+        base = sum(x["power"] for x in selected)
+        lo, hi = RARITY_POWER[next_rarity]
+        new_power = max(lo, min(hi, int(base * random.uniform(0.75, 1.02))))
+        db.execute("DELETE FROM pets WHERE id = ANY(%s)", (ids,))
+        pet = generate_pet(next_rarity, next_name, new_power)
+        db.execute("""
+            INSERT INTO pets(user_id,name,rarity,power,level,xp,attack,defense,hp,element,evolution_stage)
+            VALUES(%s,%s,%s,%s,1,0,%s,%s,%s,%s,1)
+        """, (uid, pet["name"], pet["rarity"], pet["power"], pet["attack"], pet["defense"], pet["hp"], pet["element"]))
+    reward_activity(uid, "merge")
+    add_item(uid, f"daily_merge_{today_utc().isoformat()}", 1)
+    ups = add_player_xp(uid, XP_MERGE)
+    unlocked = check_achievements(uid)
+    extra = ""
+    if ups:
+        extra += "\n🎉 <b>Уровень повышен!</b> " + ", ".join(str(x[0]) for x in ups)
+    if unlocked:
+        extra += "\n🏆 Новое достижение!"
+    await c.message.edit_text(
+        "🧬 <b>ЭВОЛЮЦИЯ ЗАВЕРШЕНА!</b>\n\n"
+        f"{RARITY_EMOJI[rarity]} {name} ×3\n⬇️\n"
+        f"{RARITY_EMOJI[next_rarity]} <b>{next_name}</b>\n"
+        f"⭐ {next_rarity} • ⚡ {new_power}\n\n✨ +{XP_MERGE} XP" + extra,
+        reply_markup=main_kb(),
+    )
+    await c.answer("Эволюция успешна! 🧬")
+
+
+# ============================================================
+# BATTLE
+# ============================================================
+
+ENEMIES = [
+    ("Forest Slime", 20, 60), ("Cave Beast", 45, 110), ("Storm Wraith", 80, 160),
+    ("Void Hunter", 120, 230), ("Ancient Titan", 180, 340), ("Aether Overlord", 260, 500)
+]
+
+
+@dp.callback_query(F.data == "battle")
+async def battle(c: CallbackQuery):
+    uid = c.from_user.id
+    p = ensure_player(uid, c.from_user.username)
+    if p["last_battle_at"]:
+        delta = (now_utc() - p["last_battle_at"]).total_seconds()
+        if delta < BATTLE_COOLDOWN_SECONDS:
+            await c.answer(f"Арена перезаряжается: {int(BATTLE_COOLDOWN_SECONDS-delta)} сек.", show_alert=True)
+            return
+    pet = db_one("SELECT * FROM pets WHERE user_id=%s ORDER BY power DESC LIMIT 1", (uid,))
+    if not pet:
+        await c.answer("Сначала получи хотя бы одного зверя", show_alert=True)
+        return
+    level = p["level"]
+    low = max(20, level * 25)
+    high = max(low + 25, level * 55 + 100)
+    enemy_name, _, _ = random.choice(ENEMIES)
+    enemy_power = random.randint(low, high)
+    if use_item(uid, "battle_elixir"):
+        player_power = int(pet["power"] * 1.10 + pet["attack"] * 0.25 + pet["defense"] * 0.15)
+        elixir_note = "\n⚔️ Battle Elixir активирован: +10%"
+    else:
+        player_power = int(pet["power"] + pet["attack"] * 0.20 + pet["defense"] * 0.15)
+        elixir_note = ""
+    roll = random.randint(-20, 20)
+    won = player_power + roll >= enemy_power
+    if won:
+        reward = random.randint(35 + level * 3, 70 + level * 6)
+        xp = XP_BATTLE_WIN
+    else:
+        reward = random.randint(10, 25 + level)
+        xp = XP_BATTLE_LOSS
+    with get_db() as db:
+        db.execute("""
+            UPDATE players SET aether=aether+%s,wins=wins+%s,losses=losses+%s,battles=battles+1,last_battle_at=%s WHERE user_id=%s
+        """, (reward, 1 if won else 0, 0 if won else 1, now_utc(), uid))
+        db.execute("INSERT INTO battle_logs(user_id,won,player_power,enemy_power,reward) VALUES(%s,%s,%s,%s,%s)", (uid, won, player_power, enemy_power, reward))
+    add_item(uid, f"daily_battle_{today_utc().isoformat()}", 1 if won else 0)
+    # daily quest counts wins only; add_item with 0 creates no progress effectively
+    ups = add_player_xp(uid, xp)
+    unlocked = check_achievements(uid)
+    if won:
+        result = "🏆 <b>ПОБЕДА!</b>"
+        icon = "💰"
+    else:
+        result = "💀 <b>ПОРАЖЕНИЕ</b>"
+        icon = "🩹"
+    extra = ""
+    if ups:
+        extra += "\n🎉 Level Up: " + ", ".join(str(x[0]) for x in ups)
+    if unlocked:
+        extra += "\n🏆 Новое достижение!"
+    balance = get_aether(uid)
+    await c.message.edit_text(
+        f"⚔️ <b>АРЕНА</b>\n\n{result}\n\n"
+        f"🐉 {pet['name']} • ⚡ {player_power}\n"
+        f"👹 {enemy_name} • ⚡ {enemy_power}\n\n"
+        f"{icon} {'+' if won else '+'}{reward} AETHER\n✨ +{xp} XP\n"
+        f"💰 Баланс: <b>{balance}</b>" + elixir_note + extra,
+        reply_markup=main_kb(),
+    )
+    await c.answer("Победа! ⚔️" if won else "В следующий раз повезёт!")
+
+
+# ============================================================
+# INVENTORY / SHOP / MARKET
+# ============================================================
+
+async def show_inventory(target):
+    uid = target.from_user.id
+    rows = db_all("SELECT item_key,qty FROM inventory WHERE user_id=%s AND qty>0 ORDER BY item_key", (uid,))
+    lines = ["🎒 <b>ИНВЕНТАРЬ</b>\n"]
+    buttons = []
+    for r in rows:
+        info = SHOP_ITEMS.get(r["item_key"])
+        if not info:
+            continue
+        lines.append(f"{info['name']} × <b>{r['qty']}</b>\n<i>{info['description']}</i>")
+        if r["item_key"] in ("lucky_charm", "xp_potion", "aether_crystal", "battle_elixir"):
+            buttons.append([InlineKeyboardButton(text=f"Использовать {info['name']}", callback_data=f"use:{r['item_key']}")])
+    if len(lines) == 1:
+        lines.append("Пока пусто. Загляни в 🏪 Магазин.")
+    buttons.append([InlineKeyboardButton(text="🏪 Магазин", callback_data="market"), InlineKeyboardButton(text="🏠", callback_data="home")])
+    await edit_or_answer(target, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@dp.callback_query(F.data == "inventory")
+async def inventory_cb(c: CallbackQuery):
+    await show_inventory(c)
+    await c.answer()
+
+
+@dp.message(Command("inventory"))
+async def inventory_cmd(m: Message):
+    await show_inventory(m)
+
+
+@dp.callback_query(F.data.startswith("use:"))
+async def use_item_cb(c: CallbackQuery):
+    uid = c.from_user.id
+    key = c.data.split(":", 1)[1]
+    if key == "lucky_charm":
+        await c.answer("🍀 Подсказка: талисман расходуется автоматически при следующем призыве.", show_alert=True)
+        return
+    if key == "battle_elixir":
+        await c.answer("⚔️ Эликсир расходуется автоматически в следующем бою.", show_alert=True)
+        return
+    if not use_item(uid, key):
+        await c.answer("Предмет закончился", show_alert=True)
+        return
+    if key == "xp_potion":
+        ups = add_player_xp(uid, 100)
+        text = "🧪 <b>XP Potion использован!</b>\n✨ +100 XP"
+        if ups:
+            text += "\n🎉 Уровень повышен!"
+    elif key == "aether_crystal":
+        with get_db() as db:
+            db.execute("UPDATE players SET aether=aether+200 WHERE user_id=%s", (uid,))
+        text = "💎 <b>Aether Crystal использован!</b>\n💰 +200 AETHER"
+    else:
+        text = "Готово!"
+    await c.message.edit_text(text, reply_markup=main_kb())
+    await c.answer("Использовано!")
+
+
+async def show_market(target):
+    p = ensure_player(target.from_user.id, target.from_user.username)
+    lines = [f"🏪 <b>AETHER MARKET</b>\n\n💰 Баланс: <b>{p['aether']}</b>\n"]
+    buttons = []
+    for key, info in SHOP_ITEMS.items():
+        lines.append(f"{info['name']} — <b>{info['price']}</b> AETHER\n{info['description']}\n")
+        buttons.append([InlineKeyboardButton(text=f"Купить {info['name']} • {info['price']}", callback_data=f"buy:{key}")])
+    buttons.append([InlineKeyboardButton(text="🎒 Инвентарь", callback_data="inventory"), InlineKeyboardButton(text="🏠", callback_data="home")])
+    await edit_or_answer(target, "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@dp.callback_query(F.data == "market")
+async def market_cb(c: CallbackQuery):
+    await show_market(c)
+    await c.answer()
+
+
+@dp.message(Command("shop"))
+async def shop_cmd(m: Message):
+    await show_market(m)
+
+
+@dp.callback_query(F.data.startswith("buy:"))
+async def buy_cb(c: CallbackQuery):
+    uid = c.from_user.id
+    key = c.data.split(":", 1)[1]
+    info = SHOP_ITEMS.get(key)
+    if not info:
+        await c.answer("Товар не найден", show_alert=True)
+        return
+    with get_db() as db:
+        p = db.execute("SELECT aether FROM players WHERE user_id=%s FOR UPDATE", (uid,)).fetchone()
+        if p["aether"] < info["price"]:
+            await c.answer("Недостаточно AETHER", show_alert=True)
+            return
+        db.execute("UPDATE players SET aether=aether-%s WHERE user_id=%s", (info["price"], uid))
+        db.execute("""
+            INSERT INTO inventory(user_id,item_key,qty) VALUES(%s,%s,1)
+            ON CONFLICT(user_id,item_key) DO UPDATE SET qty=inventory.qty+1
+        """, (uid, key))
+    await show_market(c)
+    await c.answer("Покупка совершена! 🛒")
+
+
+# ============================================================
+# RANKING / REFERRALS
+# ============================================================
+
+async def show_top(target):
+    rows = db_all("SELECT user_id,username,level,wins,aether FROM players ORDER BY level DESC,wins DESC,aether DESC LIMIT 10")
+    lines = ["🏅 <b>ТОП ИГРОКОВ</b>\n"]
+    for i, r in enumerate(rows, 1):
+        name = f"@{escape(r['username'])}" if r["username"] else str(r["user_id"])
+        lines.append(f"<b>{i}.</b> {name} — ⭐{r['level']} • 🏆{r['wins']} • 💰{r['aether']}")
+    await edit_or_answer(target, "\n".join(lines), back_kb())
+
+
+@dp.callback_query(F.data == "top")
+async def top_cb(c: CallbackQuery):
+    await show_top(c)
+    await c.answer()
+
+
+@dp.message(Command("top"))
+async def top_cmd(m: Message):
+    await show_top(m)
+
+
+async def show_ref(target):
+    uid = target.from_user.id
+    ensure_player(uid, target.from_user.username)
+    me = await bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{uid}"
+    count = db_one("SELECT COUNT(*) AS c FROM referrals WHERE referrer_id=%s", (uid,))["c"]
+    rewarded = db_one("SELECT COUNT(*) AS c FROM referrals WHERE referrer_id=%s AND reward_given=TRUE", (uid,))["c"]
+    await edit_or_answer(target, f"🤝 <b>РЕФЕРАЛЬНАЯ СИСТЕМА</b>\n\nПриглашай друзей:\n\n<code>{link}</code>\n\n👥 Приглашено: <b>{count}</b>\n🎁 Вознаграждений: <b>{rewarded}</b>\n💰 За нового активного игрока: <b>100 AETHER</b> тебе и бонус новичку.", back_kb())
+
+
+@dp.callback_query(F.data == "ref")
+async def ref_cb(c: CallbackQuery):
+    await show_ref(c)
+    await c.answer()
+
+
+@dp.message(Command("ref"))
+async def ref_cmd(m: Message):
+    await show_ref(m)
+
+
+# ============================================================
+# CLANS
+# ============================================================
+
+async def show_clan(target):
+    uid = target.from_user.id
+    clan = clan_for_user(uid)
+    if not clan:
+        text = ("🏰 <b>КЛАНЫ</b>\n\nТы пока не состоишь в клане.\n\n"
+                "Создай клан командой:\n<code>/clan_create Aether Kings</code>\n\n"
+                "Или вступи по ID:\n<code>/clan_join 123</code>\n\nСтоимость создания: <b>500 AETHER</b>.")
+        await edit_or_answer(target, text, back_kb())
+        return
+    members = db_one("SELECT COUNT(*) AS c FROM clan_members WHERE clan_id=%s", (clan["id"],))["c"]
+    owner = db_one("SELECT username FROM players WHERE user_id=%s", (clan["owner_id"],))
+    await edit_or_answer(target, f"🏰 <b>{escape(clan['name'])}</b>\n\n🆔 ID: <code>{clan['id']}</code>\n⭐ Уровень: <b>{clan['level']}</b>\n✨ XP: <b>{clan['xp']}</b>\n👥 Участников: <b>{members}</b>\n👑 Лидер: @{escape(owner['username']) if owner and owner['username'] else clan['owner_id']}", back_kb())
+
+
+@dp.callback_query(F.data == "clan")
+async def clan_cb(c: CallbackQuery):
+    await show_clan(c)
+    await c.answer()
+
+
+@dp.message(Command("clan"))
+async def clan_cmd(m: Message):
+    await show_clan(m)
+
+
+@dp.message(Command("clan_create"))
+async def clan_create(m: Message):
+    uid = m.from_user.id
+    ensure_player(uid, m.from_user.username)
+    if clan_for_user(uid):
+        await m.answer("Ты уже состоишь в клане.", reply_markup=main_kb())
+        return
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2 or len(parts[1].strip()) < 3:
+        await m.answer("Формат: /clan_create Aether Kings")
+        return
+    name = parts[1].strip()[:40]
+    with get_db() as db:
+        p = db.execute("SELECT aether FROM players WHERE user_id=%s FOR UPDATE", (uid,)).fetchone()
+        if p["aether"] < 500:
+            await m.answer("Нужно 500 AETHER для создания клана.", reply_markup=main_kb())
+            return
+        if db.execute("SELECT 1 FROM clans WHERE lower(name)=lower(%s)", (name,)).fetchone():
+            await m.answer("Клан с таким названием уже существует.")
+            return
+        clan_id = db.execute("INSERT INTO clans(name,owner_id) VALUES(%s,%s) RETURNING id", (name, uid)).fetchone()["id"]
+        db.execute("INSERT INTO clan_members(clan_id,user_id) VALUES(%s,%s)", (clan_id, uid))
+        db.execute("UPDATE players SET aether=aether-500 WHERE user_id=%s", (uid,))
+    await m.answer(f"🏰 Клан <b>{escape(name)}</b> создан! ID: <code>{clan_id}</code>", reply_markup=main_kb())
+
+
+@dp.message(Command("clan_join"))
+async def clan_join(m: Message):
+    uid = m.from_user.id
+    ensure_player(uid, m.from_user.username)
+    if clan_for_user(uid):
+        await m.answer("Ты уже состоишь в клане.")
+        return
+    parts = m.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await m.answer("Формат: /clan_join 123")
+        return
+    try:
+        clan_id = int(parts[1])
+    except ValueError:
+        await m.answer("ID клана должен быть числом.")
+        return
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM clans WHERE id=%s", (clan_id,)).fetchone():
+            await m.answer("Клан не найден.")
+            return
+        db.execute("INSERT INTO clan_members(clan_id,user_id) VALUES(%s,%s)", (clan_id, uid))
+    await m.answer("✅ Ты вступил в клан!", reply_markup=main_kb())
+
+
+# ============================================================
+# PET TRAINING
+# ============================================================
+
+@dp.callback_query(F.data.startswith("pet:"))
+async def pet_detail(c: CallbackQuery):
+    await show_pet_detail(c, int(c.data.split(":")[1]))
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("train:"))
+async def train_pet(c: CallbackQuery):
+    uid = c.from_user.id
+    pet_id = int(c.data.split(":")[1])
+    cost = 50
+    with get_db() as db:
+        p = db.execute("SELECT aether FROM players WHERE user_id=%s FOR UPDATE", (uid,)).fetchone()
+        pet = db.execute("SELECT * FROM pets WHERE id=%s AND user_id=%s FOR UPDATE", (pet_id, uid)).fetchone()
+        if not pet:
+            await c.answer("Существо не найдено", show_alert=True)
+            return
+        if p["aether"] < cost:
+            await c.answer("Недостаточно AETHER", show_alert=True)
+            return
+        if pet["level"] >= MAX_PET_LEVEL:
+            await c.answer("Существо уже максимального уровня", show_alert=True)
+            return
+        xp = pet["xp"] + 25
+        level = pet["level"]
+        while level < MAX_PET_LEVEL and xp >= 100 + level * 50:
+            xp -= 100 + level * 50
+            level += 1
+        multiplier = 1 + (level - 1) * 0.025
+        db.execute("""
+            UPDATE players SET aether=aether-%s WHERE user_id=%s
+        """, (cost, uid))
+        db.execute("""
+            UPDATE pets SET level=%s,xp=%s,power=%s,attack=%s,defense=%s,hp=%s WHERE id=%s
+        """, (level, xp, int(pet["power"] * multiplier), int(pet["attack"] * multiplier), int(pet["defense"] * multiplier), int(pet["hp"] * multi
