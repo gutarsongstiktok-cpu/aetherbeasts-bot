@@ -1258,4 +1258,321 @@ async def train_pet(c: CallbackQuery):
         """, (cost, uid))
         db.execute("""
             UPDATE pets SET level=%s,xp=%s,power=%s,attack=%s,defense=%s,hp=%s WHERE id=%s
-        """, (level, xp, int(pet["power"] * multiplier), int(pet["attack"] * multiplier), int(pet["defense"] * multiplier), int(pet["hp"] * multi
+        """, (level, xp, int(pet["power"] * multiplier), int(pet["attack"] * multiplier), int(pet["defense"] * multiplier), int(pet["hp"] * multiplier), pet_id))
+    await show_pet_detail(c, pet_id)
+    await c.answer("Существо стало сильнее! ⬆️")
+
+
+# ============================================================
+# HOME / COMMAND ALIASES / HELP CALLBACK
+# ============================================================
+
+@dp.callback_query(F.data == "home")
+async def home_cb(c: CallbackQuery):
+    p = ensure_player(c.from_user.id, c.from_user.username)
+    await c.message.edit_text(
+        "🐉 <b>AetherBeasts</b>\n\n"
+        "Добро пожаловать в мир мифических существ!\n\n"
+        f"⭐ Уровень: <b>{p['level']}</b> / {MAX_LEVEL}\n"
+        f"✨ XP: <b>{p['xp']}</b>\n"
+        f"💰 AETHER: <b>{p['aether']}</b>\n\n"
+        "Собирай, развивай, объединяй и сражайся.",
+        reply_markup=main_kb(),
+    )
+    await c.answer()
+
+
+@dp.callback_query(F.data == "profile")
+async def profile_cb(c: CallbackQuery):
+    await show_profile(c)
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("pets:"))
+async def pets_cb(c: CallbackQuery):
+    await show_pets(c, int(c.data.split(":")[1]))
+    await c.answer()
+
+
+@dp.callback_query(F.data == "help")
+async def help_cb(c: CallbackQuery):
+    await c.message.edit_text(
+        "ℹ️ <b>AetherBeasts</b>\n\n"
+        "✨ Призыв — получай случайных существ за AETHER.\n"
+        "🧬 Merge — 3 одинаковых превращаются в следующую форму.\n"
+        "⬆️ Тренировка — повышай уровень зверей.\n"
+        "⚔️ Арена — PvE-бои с наградами.\n"
+        "🎁 Daily — ежедневная серия.\n"
+        "📜 Квесты — ежедневные цели.\n"
+        "🏆 Достижения — долгосрочные цели.\n"
+        "🏪 Магазин — полезные предметы.\n"
+        "🏰 Клан — создавай сообщество.\n"
+        "🤝 Рефералы — приглашай друзей.\n\n"
+        "Все изменения сохраняются в PostgreSQL.",
+        reply_markup=back_kb(),
+    )
+    await c.answer()
+
+
+@dp.message(Command("profile"))
+async def profile_cmd(m: Message):
+    await show_profile(m)
+
+
+@dp.message(Command("pets"))
+async def pets_cmd(m: Message):
+    await show_pets(m, 0)
+
+
+# ============================================================
+# FASTAPI WEBHOOK
+# ============================================================
+
+async def configure_webhook(base_url: str):
+    url = base_url.rstrip("/") + "/webhook"
+    kwargs = {"url": url, "drop_pending_updates": False}
+    if WEBHOOK_SECRET:
+        kwargs["secret_token"] = WEBHOOK_SECRET
+    await bot.set_webhook(**kwargs)
+    if RENDER_EXTERNAL_URL:
+        try:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="🎮 Play",
+                    web_app=WebAppInfo(url=RENDER_EXTERNAL_URL + "/app")
+                )
+            )
+        except Exception:
+            log.exception("Failed to configure Mini App menu button")
+    log.info("Webhook configured: %s", url)
+    return url
+
+
+@asynccontextmanager
+async def lifespan(app_: FastAPI):
+    init_db()
+    try:
+        if RENDER_EXTERNAL_URL:
+            await configure_webhook(RENDER_EXTERNAL_URL)
+    except Exception:
+        log.exception("Automatic webhook setup failed")
+    yield
+    try:
+        await bot.session.close()
+    except Exception:
+        pass
+
+
+app = FastAPI(title="AetherBeasts", lifespan=lifespan)
+
+
+@app.get("/")
+async def root():
+    return {"status": "online", "bot": "AetherBeasts", "version": "2.0"}
+
+
+@app.get("/healthz")
+async def health():
+    db_one("SELECT 1 AS ok")
+    return {"status": "healthy"}
+
+
+@app.get("/set-webhook")
+async def set_webhook(request: Request):
+    # If WEBHOOK_SECRET is configured, require it for manual configuration too.
+    if WEBHOOK_SECRET:
+        supplied = request.query_params.get("secret", "")
+        if supplied != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    base_url = RENDER_EXTERNAL_URL or str(request.base_url).rstrip("/")
+    url = await configure_webhook(base_url)
+    return {"ok": True, "webhook": url}
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    if WEBHOOK_SECRET:
+        supplied = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if supplied != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        data = await request.json()
+        update = Update.model_validate(data, context={"bot": bot})
+        await dp.feed_update(bot, update)
+        return {"ok": True}
+    except Exception:
+        log.exception("Webhook update failed")
+        raise HTTPException(status_code=500, detail="Update processing failed")
+
+
+
+# ============================================================
+# TELEGRAM MINI APP
+# ============================================================
+
+MINIAPP_DIR = os.path.join(os.path.dirname(__file__), "static")
+app.mount("/static", StaticFiles(directory=MINIAPP_DIR), name="static")
+
+
+def validate_init_data(init_data: str):
+    if not init_data:
+        raise HTTPException(status_code=401, detail="Open AetherBeasts from Telegram")
+    try:
+        from urllib.parse import parse_qsl
+        pairs = dict(parse_qsl(init_data, keep_blank_values=True))
+        received_hash = pairs.pop("hash", None)
+        if not received_hash:
+            raise ValueError("Missing hash")
+        check_string = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        expected = hmac.new(secret, check_string.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, received_hash):
+            raise ValueError("Invalid signature")
+        auth_date = int(pairs.get("auth_date", "0"))
+        if not auth_date or abs(int(datetime.now(timezone.utc).timestamp()) - auth_date) > 86400:
+            raise ValueError("Expired init data")
+        user = json.loads(pairs.get("user", "{}"))
+        if not user.get("id"):
+            raise ValueError("Missing user")
+        return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.warning("Mini App auth failed: %s", e)
+        raise HTTPException(status_code=401, detail="Telegram authorization failed")
+
+
+def mini_user(request: Request):
+    return validate_init_data(request.headers.get("X-Telegram-Init-Data", ""))
+
+
+def pet_emoji(name: str):
+    return {"Ember Drake":"🔥","Frost Wolf":"❄️","Thunder Lynx":"⚡","Mystic Serpent":"🐍","Stone Golem":"🪨","Flame Raptor":"🦅","Ice Panther":"🐆","Storm Hawk":"🌪️","Shadow Viper":"🐍","Inferno Dragon":"🐉","Frost Wyvern":"🐲","Thunder Beast":"⚡","Void Serpent":"🌑","Ancient Phoenix":"🔥","Celestial Wolf":"🌟","Shadow Dragon":"🐲","Aether Dragon":"🐉","Eternal Phoenix":"🪽"}.get(name,"🐾")
+
+
+def serialize_pet(p):
+    d=dict(p)
+    d["emoji"]=pet_emoji(d.get("name", ""))
+    return d
+
+
+@app.get("/app")
+async def miniapp():
+    from fastapi.responses import FileResponse
+    return FileResponse(os.path.join(MINIAPP_DIR, "index.html"))
+
+
+@app.get("/api/state")
+async def api_state(request: Request):
+    user=mini_user(request)
+    p=ensure_player(user["id"], user.get("username"))
+    pets=db_all("SELECT id,name,rarity,power,level,xp,attack,defense,hp,element,evolution_stage FROM pets WHERE user_id=%s ORDER BY power DESC", (user["id"],))
+    return {"player":p,"pets":[serialize_pet(x) for x in pets],"top_pet":serialize_pet(pets[0]) if pets else None,"xp_needed":xp_needed(p["level"]),"daily":daily_status(user["id"])}
+
+
+@app.post("/api/daily")
+async def api_daily(request: Request):
+    user=mini_user(request); uid=user["id"]; p=ensure_player(uid,user.get("username"))
+    today=today_utc()
+    with get_db() as db:
+        row=db.execute("SELECT daily_date,daily_streak FROM players WHERE user_id=%s FOR UPDATE",(uid,)).fetchone()
+        if row["daily_date"]==today:
+            raise HTTPException(400,"Daily reward already claimed")
+        streak=row["daily_streak"]+1 if row["daily_date"] and (today-row["daily_date"]).days==1 else 1
+        reward=min(500,100+streak*25)
+        db.execute("UPDATE players SET aether=aether+%s,daily_date=%s,daily_streak=%s,quest_date=%s,quest_summons=0,quest_wins=0,quest_merges=0 WHERE user_id=%s",(reward,today,streak,today,uid))
+    return {"reward":reward,"streak":streak}
+
+
+@app.post("/api/summon")
+async def api_summon(request: Request):
+    user=mini_user(request); uid=user["id"]; ensure_player(uid,user.get("username")); body=await request.json(); count=int(body.get("count",1))
+    if count not in (1,10): raise HTTPException(400,"Invalid summon count")
+    cost=25 if count==1 else 225
+    results=[]
+    with get_db() as db:
+        p=db.execute("SELECT aether FROM players WHERE user_id=%s FOR UPDATE",(uid,)).fetchone()
+        if p["aether"]<cost: raise HTTPException(400,"Not enough AETHER")
+        db.execute("UPDATE players SET aether=aether-%s,summons=summons+%s,quest_summons=CASE WHEN quest_date=%s THEN quest_summons+%s ELSE %s END,quest_date=%s WHERE user_id=%s",(cost,count,today_utc(),count,count,today_utc(),uid))
+        for _ in range(count):
+            pet=generate_pet(); results.append(pet)
+            db.execute("INSERT INTO pets(user_id,name,rarity,power,level,xp,attack,defense,hp,element,evolution_stage) VALUES(%s,%s,%s,%s,1,0,%s,%s,%s,%s,1)",(uid,pet["name"],pet["rarity"],pet["power"],pet["attack"],pet["defense"],pet["hp"],pet["element"]))
+    add_player_xp(uid, XP_SUMMON*count)
+    for r in results: r["emoji"]=pet_emoji(r["name"])
+    return {"results":results,"cost":cost}
+
+
+@app.get("/api/quests")
+async def api_quests(request: Request):
+    user=mini_user(request); uid=user["id"]; p=ensure_player(uid,user.get("username")); today=today_utc()
+    if p.get("quest_date") != today:
+        with get_db() as db:
+            db.execute("UPDATE players SET quest_date=%s,quest_summons=0,quest_wins=0,quest_merges=0 WHERE user_id=%s",(today,uid))
+        p=ensure_player(uid,user.get("username"))
+    rows=[
+        {"code":"summon","title":"Summon 3 beasts","progress":min(3,p.get("quest_summons",0)) ,"target":3,"reward":100},
+        {"code":"battle","title":"Win 2 battles","progress":min(2,p.get("quest_wins",0)),"target":2,"reward":150},
+        {"code":"merge","title":"Complete 1 evolution","progress":min(1,p.get("quest_merges",0)),"target":1,"reward":200},
+    ]
+    claimed={r["code"] for r in db_all("SELECT code FROM achievements WHERE user_id=%s AND code LIKE 'daily_quest_%' AND claimed_at::date=%s",(uid,today))}
+    return {"date":str(today),"quests":[{**x,"done":x["progress"]>=x["target"],"claimed":f"daily_quest_{x['code']}" in claimed} for x in rows]}
+
+@app.post("/api/quests/claim")
+async def api_quest_claim(request: Request):
+    user=mini_user(request); uid=user["id"]; body=await request.json(); code=body.get("code"); today=today_utc()
+    rewards={"summon":100,"battle":150,"merge":200}; targets={"summon":3,"battle":2,"merge":1}
+    if code not in rewards: raise HTTPException(400,"Invalid quest")
+    p=ensure_player(uid,user.get("username"))
+    progress={"summon":p.get("quest_summons",0),"battle":p.get("quest_wins",0),"merge":p.get("quest_merges",0)}[code]
+    if progress < targets[code]: raise HTTPException(400,"Quest not completed")
+    with get_db() as db:
+        exists=db.execute("SELECT 1 FROM achievements WHERE user_id=%s AND code=%s AND claimed_at::date=%s",(uid,f"daily_quest_{code}",today)).fetchone()
+        if exists: raise HTTPException(400,"Quest already claimed")
+        db.execute("INSERT INTO achievements(user_id,code) VALUES(%s,%s)",(uid,f"daily_quest_{code}"))
+        db.execute("UPDATE players SET aether=aether+%s WHERE user_id=%s",(rewards[code],uid))
+    return {"reward":rewards[code],"code":code}
+
+@app.get("/api/merge/options")
+async def api_merge_options(request: Request):
+    user=mini_user(request); opts=get_merge_options(user["id"])
+    return {"options":[{"name":x[0],"rarity":x[1],"count":x[2],"next_rarity":x[3],"next_name":x[4],"emoji":pet_emoji(x[0]),"next_emoji":pet_emoji(x[4])} for x in opts]}
+
+
+@app.post("/api/merge")
+async def api_merge(request: Request):
+    user=mini_user(request); uid=user["id"]; body=await request.json(); idx=int(body.get("index",-1)); opts=get_merge_options(uid)
+    if idx<0 or idx>=len(opts): raise HTTPException(400,"Merge option unavailable")
+    name,rarity,count,next_rarity,next_name=opts[idx]
+    with get_db() as db:
+        selected=db.execute("SELECT id,power FROM pets WHERE user_id=%s AND name=%s AND rarity=%s ORDER BY power ASC LIMIT 3 FOR UPDATE",(uid,name,rarity)).fetchall()
+        if len(selected)<3: raise HTTPException(400,"Need three identical beasts")
+        ids=[x["id"] for x in selected]; base=sum(x["power"] for x in selected); lo,hi=RARITY_POWER[next_rarity]; power=min(hi,max(lo,int(base*random.uniform(.75,1.05))))
+        db.execute("DELETE FROM pets WHERE id=ANY(%s)",(ids,))
+        db.execute("INSERT INTO pets(user_id,name,rarity,power,level,xp,attack,defense,hp,element,evolution_stage) VALUES(%s,%s,%s,%s,1,0,%s,%s,%s,%s,1)",(uid,next_name,next_rarity,power,max(2,int(power*.5)),max(2,int(power*.28)),max(20,power*2),random_element(next_name)))
+        db.execute("UPDATE players SET merges=merges+1,quest_merges=CASE WHEN quest_date=%s THEN quest_merges+1 ELSE 1 END,quest_date=%s WHERE user_id=%s",(today_utc(),today_utc(),uid))
+    add_player_xp(uid,XP_MERGE); return {"pet":{"name":next_name,"rarity":next_rarity,"power":power,"emoji":pet_emoji(next_name)}}
+
+
+@app.post("/api/battle")
+async def api_battle(request: Request):
+    user=mini_user(request); uid=user["id"]; p=ensure_player(uid,user.get("username"));
+    if p.get("last_battle_at"):
+        elapsed=(datetime.now(timezone.utc)-p["last_battle_at"]).total_seconds()
+        if elapsed < BATTLE_COOLDOWN_SECONDS: raise HTTPException(429,f"Battle cooldown: {int(BATTLE_COOLDOWN_SECONDS-elapsed)}s")
+    rows=db_all("SELECT power FROM pets WHERE user_id=%s ORDER BY power DESC LIMIT 3",(uid,)); player_power=sum(x["power"] for x in rows)
+    if not player_power: raise HTTPException(400,"You need a beast first")
+    enemy=random.randint(max(20,player_power//2),max(35,player_power+60)); won=(player_power*random.uniform(.85,1.15))>=enemy; reward=random.randint(35,80) if won else 10; xp=50 if won else 15
+    with get_db() as db:
+        db.execute("UPDATE players SET aether=aether+%s,battles=battles+1,wins=wins+%s,losses=losses+%s,last_battle_at=NOW(),quest_wins=CASE WHEN quest_date=%s AND %s THEN quest_wins+1 ELSE quest_wins END,quest_date=%s WHERE user_id=%s",(reward,1 if won else 0,0 if won else 1,today_utc(),won,today_utc(),uid)); db.execute("INSERT INTO battle_logs(user_id,won,player_power,enemy_power,reward) VALUES(%s,%s,%s,%s,%s)",(uid,won,player_power,enemy,reward))
+    add_player_xp(uid,xp); return {"won":won,"player_power":player_power,"enemy_power":enemy,"reward":reward,"xp":xp}
+
+
+@app.get("/api/leaderboard")
+async def api_leaderboard(request: Request):
+    mini_user(request); rows=db_all("SELECT p.username,p.level,COALESCE(SUM(pt.power),0) AS power FROM players p LEFT JOIN pets pt ON pt.user_id=p.user_id GROUP BY p.user_id ORDER BY power DESC,p.level DESC LIMIT 50")
+    return {"rows":rows}
+
+if __name__ == "__main__":
+    # Local development only. Render should use the Start Command with uvicorn.
+    import uvicorn
+    uvicorn.run("bot:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
