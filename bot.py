@@ -1,4 +1,173 @@
-"""
+import os
+import random
+import logging
+from datetime import datetime, timedelta, timezone
+from contextlib import asynccontextmanager
+from html import escape
+import hashlib
+import hmac
+import json
+
+import psycopg
+from psycopg.rows import dict_row
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.filters import Command, CommandStart
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, Update, MenuButtonWebApp, WebAppInfo
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.staticfiles import StaticFiles
+
+
+# ============================================================
+# LOGGING / SETTINGS
+# ============================================================
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("aetherbeasts")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
+
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+
+START_AETHER = 100
+SUMMON_COST = 25
+MAX_LEVEL = 50
+MAX_PET_LEVEL = 30
+XP_SUMMON = 25
+XP_MERGE = 100
+XP_BATTLE_WIN = 60
+XP_BATTLE_LOSS = 20
+BATTLE_COOLDOWN_SECONDS = 35
+
+# ============================================================
+# PETS / GAME DATA
+# ============================================================
+
+PETS = {
+    "Common": ["Ember Drake", "Frost Wolf", "Thunder Lynx", "Mystic Serpent", "Stone Golem"],
+    "Uncommon": ["Flame Raptor", "Ice Panther", "Storm Hawk", "Shadow Viper"],
+    "Rare": ["Inferno Dragon", "Frost Wyvern", "Thunder Beast", "Void Serpent"],
+    "Epic": ["Ancient Phoenix", "Celestial Wolf", "Shadow Dragon"],
+    "Legendary": ["Aether Dragon", "Eternal Phoenix"],
+}
+
+EVOLUTION_CHAINS = {
+    "Ember Drake": {"Uncommon": "Flame Raptor", "Rare": "Inferno Dragon", "Epic": "Ancient Phoenix", "Legendary": "Aether Dragon"},
+    "Flame Raptor": {"Rare": "Inferno Dragon", "Epic": "Ancient Phoenix", "Legendary": "Aether Dragon"},
+    "Inferno Dragon": {"Epic": "Ancient Phoenix", "Legendary": "Aether Dragon"},
+    "Ancient Phoenix": {"Legendary": "Aether Dragon"},
+    "Frost Wolf": {"Uncommon": "Ice Panther", "Rare": "Frost Wyvern", "Epic": "Celestial Wolf", "Legendary": "Eternal Phoenix"},
+    "Ice Panther": {"Rare": "Frost Wyvern", "Epic": "Celestial Wolf", "Legendary": "Eternal Phoenix"},
+    "Frost Wyvern": {"Epic": "Celestial Wolf", "Legendary": "Eternal Phoenix"},
+    "Celestial Wolf": {"Legendary": "Eternal Phoenix"},
+    "Thunder Lynx": {"Uncommon": "Storm Hawk", "Rare": "Thunder Beast", "Epic": "Shadow Dragon", "Legendary": "Aether Dragon"},
+    "Storm Hawk": {"Rare": "Thunder Beast", "Epic": "Shadow Dragon", "Legendary": "Aether Dragon"},
+    "Thunder Beast": {"Epic": "Shadow Dragon", "Legendary": "Aether Dragon"},
+    "Shadow Dragon": {"Legendary": "Aether Dragon"},
+    "Mystic Serpent": {"Uncommon": "Shadow Viper", "Rare": "Void Serpent", "Epic": "Shadow Dragon", "Legendary": "Eternal Phoenix"},
+    "Shadow Viper": {"Rare": "Void Serpent", "Epic": "Shadow Dragon", "Legendary": "Eternal Phoenix"},
+    "Void Serpent": {"Epic": "Shadow Dragon", "Legendary": "Eternal Phoenix"},
+    "Stone Golem": {"Uncommon": "Flame Raptor", "Rare": "Thunder Beast", "Epic": "Celestial Wolf", "Legendary": "Aether Dragon"},
+}
+
+RARITY_CHANCES = {"Common": 60, "Uncommon": 25, "Rare": 10, "Epic": 4, "Legendary": 1}
+RARITY_EMOJI = {"Common": "⚪", "Uncommon": "🟢", "Rare": "🔵", "Epic": "🟣", "Legendary": "🟡"}
+RARITY_POWER = {"Common": (10, 30), "Uncommon": (30, 60), "Rare": (60, 120), "Epic": (120, 220), "Legendary": (220, 400)}
+RARITY_ORDER = ["Common", "Uncommon", "Rare", "Epic", "Legendary"]
+ELEMENTS = {"Ember": "🔥", "Frost": "❄️", "Storm": "⚡", "Shadow": "🌑", "Stone": "🪨", "Aether": "✨"}
+
+SHOP_ITEMS = {
+    "lucky_charm": {"name": "🍀 Lucky Charm", "price": 80, "description": "+15% Legendary/⭐ шанс на следующий призыв", "kind": "consumable"},
+    "xp_potion": {"name": "🧪 XP Potion", "price": 60, "description": "+100 XP игроку", "kind": "consumable"},
+    "aether_crystal": {"name": "💎 Aether Crystal", "price": 120, "description": "+200 AETHER", "kind": "consumable"},
+    "battle_elixir": {"name": "⚔️ Battle Elixir", "price": 100, "description": "+10% силы в следующем PvE-бою", "kind": "consumable"},
+}
+
+DAILY_REWARDS = [50, 75, 100, 125, 150, 200, 300]
+
+ACHIEVEMENTS = [
+    ("first_pet", "🐣 Первое существо", "Получить первое существо", 75, "aether"),
+    ("collector_5", "🗃 Коллекционер", "Собрать 5 существ", 150, "aether"),
+    ("collector_15", "🏛 Хранитель", "Собрать 15 существ", 300, "aether"),
+    ("summon_10", "✨ Призыватель", "Сделать 10 призывов", 200, "aether"),
+    ("merge_5", "🧬 Алхимик", "Сделать 5 merge", 300, "aether"),
+    ("battle_10", "⚔️ Гладиатор", "Победить 10 боёв", 400, "aether"),
+    ("battle_50", "👑 Чемпион", "Победить 50 боёв", 1000, "aether"),
+    ("level_10", "⭐ Ветеран", "Достичь 10 уровня", 250, "aether"),
+    ("legendary", "🌟 Легенда", "Получить Legendary", 1000, "aether"),
+]
+
+# ============================================================
+# BOT / FASTAPI
+# ============================================================
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+
+# ============================================================
+# DATABASE HELPERS
+# ============================================================
+
+def get_db():
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
+
+
+def db_one(sql, params=()):
+    with get_db() as db:
+        return db.execute(sql, params).fetchone()
+
+
+def db_all(sql, params=()):
+    with get_db() as db:
+        return db.execute(sql, params).fetchall()
+
+
+def db_exec(sql, params=()):
+    with get_db() as db:
+        db.execute(sql, params)
+
+
+def init_db():
+    # Existing players/pets are kept. Missing columns are added safely.
+    statements = [
+        """
+        CREATE TABLE IF NOT EXISTS players (
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            aether BIGINT NOT NULL DEFAULT 100,
+            level INTEGER NOT NULL DEFAULT 1,
+            xp INTEGER NOT NULL DEFAULT 0,
+            wins INTEGER NOT NULL DEFAULT 0,
+            losses INTEGER NOT NULL DEFAULT 0,
+            summons INTEGER NOT NULL DEFAULT 0,
+            merges INTEGER NOT NULL DEFAULT 0,
+            battles INTEGER NOT NULL DEFAULT 0,
+            last_battle_at TIMESTAMPTZ,
+            daily_date DATE,
+            daily_streak INTEGER NOT NULL DEFAULT 0,
+            quest_date DATE,
+            quest_summons INTEGER NOT NULL DEFAULT 0,
+            quest_wins INTEGER NOT NULL DEFAULT 0,
+            quest_merges INTEGER NOT NULL DEFAULT 0,
+            referral_code TEXT UNIQUE,
+            referrer_id BIGINT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+        """,
+        """
         CREATE TABLE IF NOT EXISTS pets (
             id BIGSERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL,
