@@ -181,6 +181,7 @@ def init_db():
             hp INTEGER NOT NULL DEFAULT 0,
             element TEXT NOT NULL DEFAULT 'Aether',
             evolution_stage INTEGER NOT NULL DEFAULT 1,
+            favorite BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         )
         """,
@@ -265,7 +266,7 @@ def init_db():
             "level": "INTEGER NOT NULL DEFAULT 1", "xp": "INTEGER NOT NULL DEFAULT 0",
             "attack": "INTEGER NOT NULL DEFAULT 0", "defense": "INTEGER NOT NULL DEFAULT 0",
             "hp": "INTEGER NOT NULL DEFAULT 0", "element": "TEXT NOT NULL DEFAULT 'Aether'",
-            "evolution_stage": "INTEGER NOT NULL DEFAULT 1",
+            "evolution_stage": "INTEGER NOT NULL DEFAULT 1", "favorite": "BOOLEAN NOT NULL DEFAULT FALSE",
         }
         for col, typ in pet_cols.items():
             if col not in pet_existing:
@@ -1466,7 +1467,7 @@ async def miniapp():
 async def api_state(request: Request):
     user=mini_user(request)
     p=ensure_player(user["id"], user.get("username"))
-    pets=db_all("SELECT id,name,rarity,power,level,xp,attack,defense,hp,element,evolution_stage FROM pets WHERE user_id=%s ORDER BY power DESC", (user["id"],))
+    pets=db_all("SELECT id,name,rarity,power,level,xp,attack,defense,hp,element,evolution_stage,favorite FROM pets WHERE user_id=%s ORDER BY power DESC", (user["id"],))
     return {"player":p,"pets":[serialize_pet(x) for x in pets],"top_pet":serialize_pet(pets[0]) if pets else None,"xp_needed":xp_needed(p["level"]),"daily":daily_status(user["id"])}
 
 
@@ -1566,6 +1567,115 @@ async def api_battle(request: Request):
         db.execute("UPDATE players SET aether=aether+%s,battles=battles+1,wins=wins+%s,losses=losses+%s,last_battle_at=NOW(),quest_wins=CASE WHEN quest_date=%s AND %s THEN quest_wins+1 ELSE quest_wins END,quest_date=%s WHERE user_id=%s",(reward,1 if won else 0,0 if won else 1,today_utc(),won,today_utc(),uid)); db.execute("INSERT INTO battle_logs(user_id,won,player_power,enemy_power,reward) VALUES(%s,%s,%s,%s,%s)",(uid,won,player_power,enemy,reward))
     add_player_xp(uid,xp); return {"won":won,"player_power":player_power,"enemy_power":enemy,"reward":reward,"xp":xp}
 
+
+@app.get("/api/achievements")
+async def api_achievements(request: Request):
+    user=mini_user(request); uid=user["id"]; p=ensure_player(uid,user.get("username"))
+    check_achievements(uid)
+    claimed=set(r["code"] for r in db_all("SELECT code FROM achievements WHERE user_id=%s",(uid,)))
+    pet_count=int(db_one("SELECT COUNT(*) AS c FROM pets WHERE user_id=%s",(uid,))["c"])
+    legendary=db_one("SELECT 1 FROM pets WHERE user_id=%s AND rarity='Legendary' LIMIT 1",(uid,)) is not None
+    rows=[]
+    for code,title,desc,reward,kind in ACHIEVEMENTS:
+        rows.append({"code":code,"title":title,"description":desc,"reward":reward,"done":achievement_met(code,p,pet_count,legendary),"claimed":code in claimed})
+    return {"achievements":rows}
+
+@app.get("/api/inventory")
+async def api_inventory(request: Request):
+    user=mini_user(request); uid=user["id"]; ensure_player(uid,user.get("username"))
+    rows=db_all("SELECT item_key,qty FROM inventory WHERE user_id=%s AND qty>0 ORDER BY item_key",(uid,))
+    return {"items":[{"key":r["item_key"],"qty":r["qty"],**SHOP_ITEMS.get(r["item_key"],{"name":r["item_key"],"description":"","price":0})} for r in rows]}
+
+@app.get("/api/shop")
+async def api_shop(request: Request):
+    user=mini_user(request); p=ensure_player(user["id"],user.get("username"))
+    return {"aether":p["aether"],"items":[{"key":k,**v} for k,v in SHOP_ITEMS.items()]}
+
+@app.post("/api/shop/buy")
+async def api_shop_buy(request: Request):
+    user=mini_user(request); uid=user["id"]; body=await request.json(); key=body.get("key"); info=SHOP_ITEMS.get(key)
+    if not info: raise HTTPException(400,"Unknown shop item")
+    with get_db() as db:
+        p=db.execute("SELECT aether FROM players WHERE user_id=%s FOR UPDATE",(uid,)).fetchone()
+        if p["aether"]<info["price"]: raise HTTPException(400,"Not enough AETHER")
+        db.execute("UPDATE players SET aether=aether-%s WHERE user_id=%s",(info["price"],uid))
+        db.execute("INSERT INTO inventory(user_id,item_key,qty) VALUES(%s,%s,1) ON CONFLICT(user_id,item_key) DO UPDATE SET qty=inventory.qty+1",(uid,key))
+    return {"ok":True,"key":key,"price":info["price"]}
+
+@app.post("/api/inventory/use")
+async def api_inventory_use(request: Request):
+    user=mini_user(request); uid=user["id"]; body=await request.json(); key=body.get("key")
+    if key not in SHOP_ITEMS: raise HTTPException(400,"Unknown item")
+    if key in ("lucky_charm","battle_elixir"): return {"ok":True,"message":"This item activates automatically on the next eligible action."}
+    if not use_item(uid,key): raise HTTPException(400,"Item unavailable")
+    if key=="xp_potion": add_player_xp(uid,100); message="+100 XP"
+    elif key=="aether_crystal":
+        with get_db() as db: db.execute("UPDATE players SET aether=aether+200 WHERE user_id=%s",(uid,))
+        message="+200 AETHER"
+    else: message="Used"
+    return {"ok":True,"message":message}
+
+@app.post("/api/pets/train")
+async def api_pet_train(request: Request):
+    user=mini_user(request); uid=user["id"]; body=await request.json(); pet_id=int(body.get("pet_id",0)); cost=50
+    with get_db() as db:
+        p=db.execute("SELECT aether FROM players WHERE user_id=%s FOR UPDATE",(uid,)).fetchone()
+        pet=db.execute("SELECT * FROM pets WHERE id=%s AND user_id=%s FOR UPDATE",(pet_id,uid)).fetchone()
+        if not pet: raise HTTPException(404,"Beast not found")
+        if p["aether"]<cost: raise HTTPException(400,"Not enough AETHER")
+        if pet["level"]>=MAX_PET_LEVEL: raise HTTPException(400,"Beast is max level")
+        xp=pet["xp"]+25; level=pet["level"]
+        while level<MAX_PET_LEVEL and xp>=100+level*50: xp-=100+level*50; level+=1
+        mult=1+(level-1)*0.025
+        db.execute("UPDATE players SET aether=aether-%s WHERE user_id=%s",(cost,uid))
+        db.execute("UPDATE pets SET level=%s,xp=%s,power=%s,attack=%s,defense=%s,hp=%s WHERE id=%s",(level,xp,int(pet["power"]*mult),int(pet["attack"]*mult),int(pet["defense"]*mult),int(pet["hp"]*mult),pet_id))
+    return {"ok":True,"level":level,"cost":cost}
+
+@app.post("/api/pets/favorite")
+async def api_pet_favorite(request: Request):
+    user=mini_user(request); uid=user["id"]; body=await request.json(); pet_id=int(body.get("pet_id",0))
+    with get_db() as db:
+        if not db.execute("SELECT id FROM pets WHERE id=%s AND user_id=%s",(pet_id,uid)).fetchone(): raise HTTPException(404,"Beast not found")
+        db.execute("UPDATE pets SET favorite=FALSE WHERE user_id=%s",(uid,))
+        db.execute("UPDATE pets SET favorite=TRUE WHERE id=%s AND user_id=%s",(pet_id,uid))
+    return {"ok":True,"pet_id":pet_id}
+
+@app.get("/api/profile")
+async def api_profile(request: Request):
+    user=mini_user(request); p=ensure_player(user["id"],user.get("username"))
+    count=int(db_one("SELECT COUNT(*) AS c FROM pets WHERE user_id=%s",(user["id"],))["c"])
+    power=int(db_one("SELECT COALESCE(SUM(power),0) AS power FROM pets WHERE user_id=%s",(user["id"],))["power"])
+    return {"player":p,"pet_count":count,"power":power}
+
+@app.get("/api/clan")
+async def api_clan(request: Request):
+    user=mini_user(request); uid=user["id"]; clan=clan_for_user(uid)
+    if not clan: return {"clan":None}
+    members=int(db_one("SELECT COUNT(*) AS c FROM clan_members WHERE clan_id=%s",(clan["id"],))["c"])
+    return {"clan":{**dict(clan),"members":members}}
+
+@app.post("/api/clan/create")
+async def api_clan_create(request: Request):
+    user=mini_user(request); uid=user["id"]; ensure_player(uid,user.get("username")); body=await request.json(); name=str(body.get("name","")).strip()[:40]
+    if len(name)<3: raise HTTPException(400,"Clan name is too short")
+    if clan_for_user(uid): raise HTTPException(400,"Already in a clan")
+    with get_db() as db:
+        p=db.execute("SELECT aether FROM players WHERE user_id=%s FOR UPDATE",(uid,)).fetchone()
+        if p["aether"]<500: raise HTTPException(400,"Need 500 AETHER")
+        if db.execute("SELECT 1 FROM clans WHERE lower(name)=lower(%s)",(name,)).fetchone(): raise HTTPException(400,"Clan already exists")
+        clan_id=db.execute("INSERT INTO clans(name,owner_id) VALUES(%s,%s) RETURNING id",(name,uid)).fetchone()["id"]
+        db.execute("INSERT INTO clan_members(clan_id,user_id) VALUES(%s,%s)",(clan_id,uid))
+        db.execute("UPDATE players SET aether=aether-500 WHERE user_id=%s",(uid,))
+    return {"ok":True,"clan_id":clan_id,"name":name}
+
+@app.post("/api/clan/join")
+async def api_clan_join(request: Request):
+    user=mini_user(request); uid=user["id"]; ensure_player(uid,user.get("username")); body=await request.json(); clan_id=int(body.get("clan_id",0))
+    if clan_for_user(uid): raise HTTPException(400,"Already in a clan")
+    with get_db() as db:
+        if not db.execute("SELECT 1 FROM clans WHERE id=%s",(clan_id,)).fetchone(): raise HTTPException(404,"Clan not found")
+        db.execute("INSERT INTO clan_members(clan_id,user_id) VALUES(%s,%s)",(clan_id,uid))
+    return {"ok":True,"clan_id":clan_id}
 
 @app.get("/api/leaderboard")
 async def api_leaderboard(request: Request):
