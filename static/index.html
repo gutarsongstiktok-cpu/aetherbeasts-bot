@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#050713">
+<title>AetherBeasts</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="stars"></div><div class="noise"></div>
+<div id="app">
+  <header class="topbar">
+    <div><div class="brand">AETHER<span>BEASTS</span></div><div id="welcome" class="sub">Connecting to Aether…</div></div>
+    <button class="circle" onclick="openSettings()">⚙</button>
+  </header>
+  <section class="hud">
+    <div class="hud-card"><span class="hud-icon">💠</span><div><small>AETHER</small><b id="aether">0</b></div></div>
+    <div class="hud-card"><span class="hud-icon">⚡</span><div><small>ENERGY</small><b id="energy">0/100</b></div></div>
+    <div class="hud-card"><span class="hud-icon">★</span><div><small>LEVEL</small><b id="level">1</b></div></div>
+  </section>
+  <section class="xp"><div class="xp-row"><span>PLAYER XP</span><b id="xp">0/100</b></div><div class="bar"><i id="xpbar"></i></div></section>
+  <main id="screen"></main>
+</div>
+<nav id="nav">
+  <button data-screen="home" onclick="go('home')">⌂<span>Home</span></button>
+  <button data-screen="beasts" onclick="go('beasts')">🐲<span>Beasts</span></button>
+  <button data-screen="summon" onclick="go('summon')" class="summon-nav">✦<span>Summon</span></button>
+  <button data-screen="arena" onclick="go('arena')">⚔<span>Arena</span></button>
+  <button data-screen="more" onclick="go('more')">☰<span>More</span></button>
+</nav>
+<div id="toast"></div>
+<div id="modal-root"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
